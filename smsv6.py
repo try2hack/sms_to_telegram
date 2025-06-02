@@ -11,9 +11,7 @@ import sys
 
 # Logging Setup
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', "%Y-%m-%d %H:%M:%S")
-
 file_handler = logging.FileHandler('sms_service.log', encoding='utf-8')
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
@@ -34,29 +32,78 @@ logger.addHandler(console_handler)
 # Configuration
 TELEGRAM_BOT_TOKEN = "xxx"
 TELEGRAM_CHAT_ID = "xxx"
-
 CONFIG = {
     "SERIAL_BAUDRATE": 115200,
     "SERIAL_TIMEOUT": 10,
-    "HOTPLUG_POLL_INTERVAL": 10, 
-    "USSD_DELAY": 5
+    "HOTPLUG_POLL_INTERVAL": 10,
+    "USSD_DELAY": 5,
+    "DEBUG_ENABLED": False
 }
+
+logger.setLevel(logging.DEBUG if CONFIG["DEBUG_ENABLED"] else logging.INFO)
 
 port_lock = threading.Lock()
 
 # Utility Functions
-def decode_ucs2(hex_str: str) -> str:
-    if not re.fullmatch(r'[0-9A-Fa-f]+', hex_str) or len(hex_str) % 4 != 0:
+def decode_ussd(hex_str: str) -> str:
+    logger.debug(f"Attempting to decode USSD: {hex_str}")
+    if not re.fullmatch(r'[0-9A-Fa-f]+', hex_str) or len(hex_str) < 4 or len(hex_str) % 2 != 0:
+        logger.debug(f"Not a valid hex string for USSD, returning as is: {hex_str}")
         return hex_str
     try:
-        return bytes.fromhex(hex_str).decode('utf-16-be')
+        decoded = bytes.fromhex(hex_str).decode('utf-16-be')
+        logger.debug(f"Successfully decoded USSD to: {decoded}")
+        return decoded
     except Exception as e:
-        logger.error(f"Error decoding UCS2: {e}")
+        logger.error(f"Error decoding USSD: {e}")
         return hex_str
 
+def decode_sms(text: str) -> str:
+    logger.debug(f"Attempting to decode SMS: {text}")
+    if text.isdigit():
+        logger.debug(f"SMS is all digits, returning as is: {text}")
+        return text
+    if re.fullmatch(r'[0-9A-Fa-f]+', text) and len(text) >= 4 and len(text) % 2 == 0:
+        try:
+            decoded = bytes.fromhex(text).decode('utf-16-be')
+            logger.debug(f"Successfully decoded SMS to: {decoded}")
+            return decoded
+        except Exception as e:
+            logger.error(f"Error decoding SMS: {e}")
+            return text
+    logger.debug(f"SMS is not HEX, returning as is: {text}")
+    return text
+
 def extract_phone_number(decoded: str) -> str:
-    match = re.search(r'(\+66\d{8,9}|\d{10})', decoded)
-    return match.group(0) if match else "ไม่พบเบอร์"
+    logger.debug(f"Extracting phone number from: {decoded}")
+    cleaned = re.sub(r'\D+', '', decoded)
+    logger.debug(f"Cleaned input: {cleaned}")
+    patterns = [
+        r'(\+66\d{8,9})',
+        r'(0\d{9})',
+        r'(\d{10})'
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, decoded)
+        if match:
+            phone = match.group(0)
+            logger.debug(f"Matched phone pattern: {phone}")
+            if phone.startswith('0') and len(phone) == 10:
+                logger.debug(f"Using phone as is: {phone}")
+                return phone
+            elif phone.startswith('+66'):
+                logger.debug(f"Using phone as is: {phone}")
+                return phone
+            elif len(phone) == 10:
+                phone = '0' + phone[1:]
+                logger.debug(f"Converted to: {phone}")
+                return phone
+    if len(cleaned) >= 10 and cleaned.isdigit():
+        phone = '0' + cleaned[1:10]
+        logger.debug(f"Using cleaned input as phone: {phone}")
+        return phone
+    logger.warning(f"ไม่สามารถแยกเบอร์จากข้อความ: {decoded}")
+    return "ไม่พบเบอร์"
 
 def send_to_telegram(message: str):
     try:
@@ -74,7 +121,6 @@ def send_sms_to_telegram(sender, timestamp, message, port, phone_number=None):
     text = f"📩 {phone_number or 'ไม่ทราบ'}: {message}"
     send_to_telegram(text)
 
-# Modem Class
 class Modem:
     def __init__(self, port: str, baudrate: int = CONFIG["SERIAL_BAUDRATE"]):
         self.port = port
@@ -91,7 +137,7 @@ class Modem:
                 return True
             except serial.SerialException as e:
                 if "PermissionError(13" in str(e):
-                    return False  # ข้ามการ log สำหรับ PermissionError(13)
+                    return False
                 logger.error(f"เชื่อมต่อพอร์ต {self.port} ไม่สำเร็จ: {e}")
                 return False
 
@@ -109,11 +155,10 @@ class Modem:
             return self.serial.read(self.serial.in_waiting).decode('ascii', errors='ignore')
         except serial.SerialException as e:
             if "PermissionError(13" in str(e):
-                return ""  # ข้ามการ log สำหรับ PermissionError(13)
+                return ""
             logger.error(f"ส่งคำสั่งที่ {self.port} ล้มเหลว: {e}")
             return ""
 
-# Modem Logic
 def initialize_modem(modem: Modem) -> bool:
     if not modem.connect():
         return False
@@ -137,46 +182,54 @@ def delete_all_sms(modem: Modem):
     finally:
         modem.close()
 
+def check_ussd(modem: Modem, net: str, code: bytes) -> Optional[str]:
+    logger.info(f"🔍 เช็คเบอร์ {net} ที่ {modem.port}")
+    res = modem.send_command(code, delay=CONFIG["USSD_DELAY"])
+    logger.debug(f"USSD raw response from {net} at {modem.port}: {res}")
+    match = re.search(r'\+CUSD:\s*\d+,"([^"]+)",?', res)
+    if match:
+        hex_str = match.group(1)
+        logger.debug(f"USSD hex string: {hex_str}")
+        decoded = decode_ussd(hex_str)
+        phone = extract_phone_number(decoded)
+        if phone != "ไม่พบเบอร์":
+            logger.info(f"✅ พบเบอร์ {phone} (ตอบจาก USSD {net}) ที่ {modem.port}")
+            return phone
+        logger.warning(f"ไม่สามารถแยกเบอร์จาก USSD {net}: {decoded}")
+    else:
+        logger.warning(f"ไม่พบ +CUSD ในการตอบกลับจาก {net} ที่ {modem.port}")
+    return None
+
 def get_phone_number(modem: Modem) -> Optional[str]:
     if not modem.connect():
+        logger.error(f"ไม่สามารถเชื่อมต่อพอร์ต {modem.port}")
         return None
     try:
         if "+CREG: 0,0" in modem.send_command(b'AT+CREG?\r\n'):
+            logger.warning(f"โมเด็มที่ {modem.port} ไม่ได้ลงทะเบียนในเครือข่าย")
             return None
         ussd_codes = [
             ("DTAC", b'AT+CUSD=1,"*102#",15\r\n'),
             ("AIS", b'AT+CUSD=1,"*545#",15\r\n'),
             ("True", b'AT+CUSD=1,"*933#",15\r\n')
         ]
-        # ลองรอบแรก
-        for net, code in ussd_codes:
-            logger.info(f"🔍 รอบที่ 1: เช็คเบอร์ {net} ที่ {modem.port}")
-            res = modem.send_command(code, delay=CONFIG["USSD_DELAY"])
-            match = re.search(r'\+CUSD:\s*\d+,"([^"]+)"', res)
-            if match:
-                decoded = decode_ucs2(match.group(1))
-                phone = extract_phone_number(decoded)
-                if phone != "ไม่พบเบอร์":
-                    logger.info(f"✅ พบเบอร์ {phone} จาก {net} ที่ {modem.port}")
+        for attempt in range(2):  # Try twice
+            logger.info(f"Attempt {attempt + 1} to get phone number at {modem.port}")
+            for net, code in ussd_codes:
+                phone = check_ussd(modem, net, code)
+                if phone:
                     return phone
-        # ถ้ารอบแรกไม่พบ ลองรอบที่สอง
-        logger.info(f"🔄 รอบที่ 2: วนเช็คเบอร์ใหม่ที่ {modem.port}")
-        for net, code in ussd_codes:
-            logger.info(f"🔍 รอบที่ 2: เช็คเบอร์ {net} ที่ {modem.port}")
-            res = modem.send_command(code, delay=CONFIG["USSD_DELAY"])
-            match = re.search(r'\+CUSD:\s*\d+,"([^"]+)"', res)
-            if match:
-                decoded = decode_ucs2(match.group(1))
-                phone = extract_phone_number(decoded)
-                if phone != "ไม่พบเบอร์":
-                    logger.info(f"✅ พบเบอร์ {phone} จาก {net} ที่ {modem.port}")
-                    return phone
-        logger.warning(f"❌ ไม่พบเบอร์จาก USSD ที่ {modem.port}")
+            logger.info(f"No phone number found in attempt {attempt + 1} at {modem.port}")
+        logger.warning(f"❌ ไม่พบเบอร์จาก USSD ที่ {modem.port} หลังจากลอง 2 รอบ")
+        return None
+    except Exception as e:
+        logger.error(f"เกิดข้อผิดพลาดใน get_phone_number ที่ {modem.port}: {e}")
         return None
     finally:
         modem.close()
 
 def read_sms(modem: Modem, stop_event: threading.Event):
+    logger.info(f"Start thread for {modem.port}")  # Moved log here, only logs once per thread start
     if not modem.connect():
         return
     try:
@@ -195,12 +248,13 @@ def read_sms(modem: Modem, stop_event: threading.Event):
                                 sender = match.group(1)
                                 timestamp = match.group(2)
                                 message = sms_lines[i+1].strip() if i+1 < len(sms_lines) else ""
-                                message = decode_ucs2(message)
+                                message = decode_sms(message)
                                 send_sms_to_telegram(sender, timestamp, message, modem.port, modem.phone_number)
                                 modem.send_command(f'AT+CMGD={index}\r\n'.encode())
-            time.sleep(1)
+                    time.sleep(1)
     finally:
         modem.close()
+        logger.info(f"Thread for {modem.port} stopped")
 
 def find_huawei_port():
     return [p.device for p in serial.tools.list_ports.comports() if "HUAWEI Mobile Connect - 3G PC UI Interface" in p.description]
@@ -212,89 +266,96 @@ def monitor_modems(active_modems, modem_threads):
             active_ports = set(active_modems.keys())
             new_ports = current_ports - active_ports
             for port in new_ports:
+                if port in modem_threads:  # Prevent duplicate thread creation
+                    logger.debug(f"Port {port} already has an active thread, skipping")
+                    continue
                 modem = Modem(port)
                 if initialize_modem(modem):
                     phone_number = get_phone_number(modem)
                     modem.phone_number = phone_number
-                    active_modems[port] = modem
                     delete_all_sms(modem)
                     stop_event = threading.Event()
                     thread = threading.Thread(target=read_sms, args=(modem, stop_event))
                     thread.daemon = True
                     modem_threads[port] = (thread, stop_event)
+                    active_modems[port] = modem
                     thread.start()
                     send_to_telegram(f"🟢 {port}: {phone_number or 'ไม่ทราบ'}")
-
             removed_ports = active_ports - current_ports
             for port in removed_ports:
-                modem = active_modems.pop(port)
-                thread, stop_event = modem_threads.pop(port)
-                stop_event.set()
-                thread.join()
+                modem = active_modems.pop(port, None)
+                thread, stop_event = modem_threads.pop(port, (None, None))
+                if stop_event:
+                    stop_event.set()
+                    thread.join(timeout=5)
+                    if thread.is_alive():
+                        logger.warning(f"Thread for {port} ยังไม่จบหลัง timeout")
+                    else:
+                        logger.info(f"Thread for {port} stopped")
                 send_to_telegram(f"🔴 {port} ถอด")
-
             time.sleep(CONFIG["HOTPLUG_POLL_INTERVAL"])
         except Exception as e:
             logger.error(f"เกิดข้อผิดพลาดใน monitor_modems: {e}")
 
-# Main
 def main():
     print("🚀 เริ่มระบบ SMS...")
     logger.info("เริ่มต้นระบบ SMS Service...")
     active_modems = {}
     modem_threads = {}
-
     ports = find_huawei_port()
     if not ports:
         print("❌ ไม่พบโมเด็ม HUAWEI")
         logger.error("ไม่พบ HUAWEI 3G Modem ที่ใช้งานได้")
         return
-
     modem_info = []
     threads = []
     for port in ports:
         logger.info(f"ตรวจสอบพอร์ต {port}")
         modem = Modem(port)
+        active_modems[port] = modem
+        logger.debug(f"Added {port} to active_modems")
         thread = threading.Thread(target=lambda m=modem: setattr(m, 'phone_number', get_phone_number(m)))
         thread.daemon = True
         threads.append(thread)
         thread.start()
-        active_modems[port] = modem
-
     for thread in threads:
         thread.join()
-
     for port in ports:
+        if port not in active_modems:
+            logger.error(f"Port {port} not found in active_modems")
+            continue
         modem = active_modems[port]
         if initialize_modem(modem):
             print(f"🟢 พบโมเด็ม: {port} ({modem.phone_number or 'ไม่พบเบอร์'})")
             delete_all_sms(modem)
             modem_info.append((port, modem.phone_number or "ไม่พบเบอร์"))
-            stop_event = threading.Event()
-            thread = threading.Thread(target=read_sms, args=(modem, stop_event))
-            thread.daemon = True
-            modem_threads[port] = (thread, stop_event)
-            thread.start()
+            if port not in modem_threads:  # Prevent duplicate thread creation
+                stop_event = threading.Event()
+                thread = threading.Thread(target=read_sms, args=(modem, stop_event))
+                thread.daemon = True
+                modem_threads[port] = (thread, stop_event)
+                thread.start()
         else:
             print(f"🔴 โมเด็มไม่ตอบสนอง: {port}")
             modem_info.append((port, "ไม่ตอบสนอง"))
-
     summary = "\n".join([f"📡 ระบบเริ่ม"] + [f"{p}: {n}" for p, n in modem_info])
     send_to_telegram(summary)
-
     monitor_thread = threading.Thread(target=monitor_modems, args=(active_modems, modem_threads))
     monitor_thread.daemon = True
     monitor_thread.start()
-
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         print("🛑 ระบบหยุด")
         logger.info("ระบบถูกหยุดโดยผู้ใช้")
-        for _, (thread, stop_event) in modem_threads.items():
+        for port, (thread, stop_event) in list(modem_threads.items()):
             stop_event.set()
-            thread.join()
+            thread.join(timeout=5)
+            if thread.is_alive():
+                logger.warning(f"Thread for {port} ยังไม่จบหลัง timeout")
+            else:
+                logger.info(f"Thread for {port} stopped")
 
 if __name__ == "__main__":
     main()
