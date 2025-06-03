@@ -134,6 +134,7 @@ class Modem:
                 if self.serial and self.serial.is_open:
                     self.serial.close()
                 self.serial = serial.Serial(self.port, self.baudrate, timeout=CONFIG["SERIAL_TIMEOUT"])
+                logger.debug(f"Connected to port {self.port}")
                 return True
             except serial.SerialException as e:
                 if "PermissionError(13" in str(e):
@@ -145,14 +146,21 @@ class Modem:
         if self.serial and self.serial.is_open:
             try:
                 self.serial.close()
+                logger.debug(f"Closed port {self.port}")
             except Exception as e:
                 logger.error(f"ปิดพอร์ต {self.port} ล้มเหลว: {e}")
 
     def send_command(self, command: bytes, delay: float = 1.0) -> str:
         try:
+            if not self.serial or not self.serial.is_open:
+                logger.error(f"Port {self.port} is not open before sending command")
+                return ""
             self.serial.write(command)
+            logger.debug(f"Sent command to {self.port}: {command}")
             time.sleep(delay)
-            return self.serial.read(self.serial.in_waiting).decode('ascii', errors='ignore')
+            response = self.serial.read(self.serial.in_waiting).decode('ascii', errors='ignore')
+            logger.debug(f"Received response from {self.port}: {response}")
+            return response
         except serial.SerialException as e:
             if "PermissionError(13" in str(e):
                 return ""
@@ -182,43 +190,98 @@ def delete_all_sms(modem: Modem):
     finally:
         modem.close()
 
+def get_network_operator(modem: Modem) -> Optional[str]:
+    if not modem.connect():
+        logger.error(f"ไม่สามารถเชื่อมต่อพอร์ต {modem.port} เพื่อตรวจสอบเครือข่าย")
+        return None
+    try:
+        response = modem.send_command(b'AT+COPS?\r\n', delay=1.0)
+        logger.debug(f"Network operator response: {response}")
+        match = re.search(r'\+COPS: \d+,\d+,"([^"]+)",\d+', response)
+        if match:
+            operator = match.group(1).lower()
+            logger.info(f"พบเครือข่าย: {operator} ที่ {modem.port}")
+            return operator
+        logger.warning(f"ไม่พบข้อมูลเครือข่ายจาก +COPS ที่ {modem.port}")
+        return None
+    except Exception as e:
+        logger.error(f"เกิดข้อผิดพลาดในการตรวจสอบเครือข่ายที่ {modem.port}: {e}")
+        return None
+    finally:
+        modem.close()
+
 def check_ussd(modem: Modem, net: str, code: bytes) -> Optional[str]:
     logger.info(f"🔍 เช็คเบอร์ {net} ที่ {modem.port}")
-    res = modem.send_command(code, delay=CONFIG["USSD_DELAY"])
-    logger.debug(f"USSD raw response from {net} at {modem.port}: {res}")
-    match = re.search(r'\+CUSD:\s*\d+,"([^"]+)",?', res)
-    if match:
-        hex_str = match.group(1)
-        logger.debug(f"USSD hex string: {hex_str}")
-        decoded = decode_ussd(hex_str)
-        phone = extract_phone_number(decoded)
-        if phone != "ไม่พบเบอร์":
-            logger.info(f"✅ พบเบอร์ {phone} (ตอบจาก USSD {net}) ที่ {modem.port}")
-            return phone
-        logger.warning(f"ไม่สามารถแยกเบอร์จาก USSD {net}: {decoded}")
-    else:
-        logger.warning(f"ไม่พบ +CUSD ในการตอบกลับจาก {net} ที่ {modem.port}")
-    return None
+    if not modem.connect():
+        logger.error(f"ไม่สามารถเชื่อมต่อพอร์ต {modem.port} สำหรับ USSD")
+        return None
+    try:
+        res = modem.send_command(code, delay=CONFIG["USSD_DELAY"])
+        logger.debug(f"USSD raw response from {net} at {modem.port}: {res}")
+        match = re.search(r'\+CUSD:\s*\d+,"([^"]+)",?', res)
+        if match:
+            hex_str = match.group(1)
+            logger.debug(f"USSD hex string: {hex_str}")
+            decoded = decode_ussd(hex_str)
+            phone = extract_phone_number(decoded)
+            if phone != "ไม่พบเบอร์":
+                logger.info(f"✅ พบเบอร์ {phone} (ตอบจาก USSD {net}) ที่ {modem.port}")
+                return phone
+            logger.warning(f"ไม่สามารถแยกเบอร์จาก USSD {net}: {decoded}")
+        else:
+            logger.warning(f"ไม่พบ +CUSD ในการตอบกลับจาก {net} ที่ {modem.port}")
+        return None
+    finally:
+        modem.close()
 
 def get_phone_number(modem: Modem) -> Optional[str]:
     if not modem.connect():
         logger.error(f"ไม่สามารถเชื่อมต่อพอร์ต {modem.port}")
         return None
     try:
+        # Check network registration
         if "+CREG: 0,0" in modem.send_command(b'AT+CREG?\r\n'):
             logger.warning(f"โมเด็มที่ {modem.port} ไม่ได้ลงทะเบียนในเครือข่าย")
             return None
-        ussd_codes = [
-            ("DTAC", b'AT+CUSD=1,"*102#",15\r\n'),
-            ("AIS", b'AT+CUSD=1,"*545#",15\r\n'),
-            ("True", b'AT+CUSD=1,"*933#",15\r\n')
-        ]
+        # Define USSD codes for known operators
+        ussd_codes = {
+            "dtac": b'AT+CUSD=1,"*102#",15\r\n',
+            "ais": b'AT+CUSD=1,"*545#",15\r\n',
+            "true": b'AT+CUSD=1,"*933#",15\r\n'
+        }
+        # Get network operator
+        modem.close()  # Close connection before getting operator
+        operator = get_network_operator(modem)
+        if not operator:
+            logger.warning(f"ไม่สามารถระบุเครือข่ายได้ที่ {modem.port}")
+            send_to_telegram(f"⚠️ {modem.port}: ไม่สามารถระบุเครือข่ายได้")
+            return None
+        # Normalize operator name for matching
+        operator = operator.lower()
+        # Map operator names to known keys
+        operator_mapping = {
+            "dtac": "dtac",
+            "happy": "dtac",  # DTAC's alternate branding
+            "ais": "ais",
+            "true": "true",
+            "truemove": "true",
+            "truemove h": "true"
+        }
+        matched_operator = None
+        for key, value in operator_mapping.items():
+            if key in operator:
+                matched_operator = value
+                break
+        if matched_operator not in ussd_codes:
+            logger.warning(f"เครือข่าย {operator} ไม่ได้รับการสนับสนุนที่ {modem.port}")
+            send_to_telegram(f"⚠️ {modem.port}: เครือข่าย {operator} ไม่ได้รับการสนับสนุน")
+            return None
+        # Try USSD for the detected operator
         for attempt in range(2):  # Try twice
-            logger.info(f"Attempt {attempt + 1} to get phone number at {modem.port}")
-            for net, code in ussd_codes:
-                phone = check_ussd(modem, net, code)
-                if phone:
-                    return phone
+            logger.info(f"Attempt {attempt + 1} to get phone number at {modem.port} for {matched_operator}")
+            phone = check_ussd(modem, matched_operator, ussd_codes[matched_operator])
+            if phone:
+                return phone
             logger.info(f"No phone number found in attempt {attempt + 1} at {modem.port}")
         logger.warning(f"❌ ไม่พบเบอร์จาก USSD ที่ {modem.port} หลังจากลอง 2 รอบ")
         return None
@@ -229,7 +292,7 @@ def get_phone_number(modem: Modem) -> Optional[str]:
         modem.close()
 
 def read_sms(modem: Modem, stop_event: threading.Event):
-    logger.info(f"Start thread for {modem.port}")  # Moved log here, only logs once per thread start
+    logger.info(f"Start thread for {modem.port}")
     if not modem.connect():
         return
     try:
@@ -266,7 +329,7 @@ def monitor_modems(active_modems, modem_threads):
             active_ports = set(active_modems.keys())
             new_ports = current_ports - active_ports
             for port in new_ports:
-                if port in modem_threads:  # Prevent duplicate thread creation
+                if port in modem_threads:
                     logger.debug(f"Port {port} already has an active thread, skipping")
                     continue
                 modem = Modem(port)
@@ -329,7 +392,7 @@ def main():
             print(f"🟢 พบโมเด็ม: {port} ({modem.phone_number or 'ไม่พบเบอร์'})")
             delete_all_sms(modem)
             modem_info.append((port, modem.phone_number or "ไม่พบเบอร์"))
-            if port not in modem_threads:  # Prevent duplicate thread creation
+            if port not in modem_threads:
                 stop_event = threading.Event()
                 thread = threading.Thread(target=read_sms, args=(modem, stop_event))
                 thread.daemon = True
